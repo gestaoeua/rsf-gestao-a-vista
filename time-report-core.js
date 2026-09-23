@@ -3,6 +3,8 @@
  const text=v=>String(v??'').trim();
  function dateKey(value){
   const s=text(value); let y,m,d,match;
+  const native=s.match(/^Date\((\d{4}),(\d{1,2}),(\d{1,2})(?:,.*)?\)$/);
+  if(native)return dateKey(`${native[1]}-${String(+native[2]+1).padStart(2,'0')}-${String(native[3]).padStart(2,'0')}`);
   if((match=s.match(/^(\d{4})-(\d{2})-(\d{2})$/))) [,y,m,d]=match;
   else if((match=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/))) [,d,m,y]=match;
   else return null;
@@ -17,10 +19,14 @@
   if(ap)h=h%12+(ap==='PM'?12:0);
   return h*60+min+sec/60;
  }
- function decimal(value){const s=text(value).replace(',','.');return s!==''&&/^\d+(\.\d+)?$/.test(s)?Number(s):null}
+ function decimal(value){const s=text(value).replace(',','.');return s!==''&&/^\d+(\.\d+)?$/.test(s)&&Number.isFinite(Number(s))?Number(s):null}
  function normalize(records,projects){
+  const projectMap=new Map(projects.map(p=>[text(p.id),p]));
+  const identities=new Map();records.forEach(x=>{const name=text(x.worker),id=text(x.workerId);if(name&&id){if(!identities.has(name))identities.set(name,new Set());identities.get(name).add(id)}});
+  const seen=new Map(),duplicates=new Set(),conflicts=new Set();
+  records.forEach((r,i)=>{const id=text(r.id);if(!id)return;const signature=JSON.stringify(['worker','workerId','date','exitDate','entry','exit','projectId','client','reportHours','rate','reportStatus','correction','notes'].map(k=>text(r[k])));if(seen.has(id)){if(seen.get(id).signature===signature)duplicates.add(i);else conflicts.add(id)}else seen.set(id,{signature,index:i})});
   const rows=records.map((x,i)=>{
-   const p=projects.find(p=>p.id===x.projectId),date=dateKey(x.date),endDate=x.exitDate?dateKey(x.exitDate):date;
+   const p=projectMap.get(text(x.projectId)),date=dateKey(x.reportDate??x.date),endDate=x.exitDate?dateKey(x.exitDate):date;
    const a=clock(x.entry),b=clock(x.exit),hasEntry=!!text(x.entry),hasExit=!!text(x.exit);
    const declared=decimal(x.reportHours),issues=[];
    let minutes=null,start=null,end=null,basis='';
@@ -37,26 +43,34 @@
    }else if(hasEntry||hasExit){issues.push(hasEntry?'Saída pendente':'Entrada pendente')}
    else if(declared!==null){minutes=declared*60;basis='Horas lançadas; sem entrada/saída'}
    else issues.push('Horas e horários ausentes');
+   if(minutes!==null&&minutes>24*60){issues.push('Segmento superior a 24 horas; confira a data de saída');minutes=null}
+   if(duplicates.has(i)){issues.push('Registro duplicado; contado somente uma vez');minutes=null}
+   if(conflicts.has(text(x.id))){issues.push('Mesmo ID com dados conflitantes; confira a origem');minutes=null}
+   const linked=identities.get(text(x.worker));
+   if(!text(x.workerId)&&linked?.size>1){issues.push('Nome associado a mais de um funcionário; informe worker_id');minutes=null}
    if(!date||!text(x.worker))minutes=null;
    const correction=text(x.correction),sourceStatus=text(x.reportStatus);
-   if(/diverg|pend|error|invál|invalid/i.test(sourceStatus))issues.push('Status da origem: '+sourceStatus);
-   return {id:text(x.id)||'linha-'+i,worker:text(x.worker)||'Não informado',workerKey:text(x.workerId)||text(x.worker),date,rawDate:text(x.date),projectId:text(x.projectId)||'__unknown',project:p?.name||text(x.projectId)||'Sem projeto',client:text(x.client)||text(p?.client),entry:text(x.entry),exit:text(x.exit),exitDate:endDate,minutes,start,end,basis,issues,correction,notes:text(x.notes),sourceStatus,rate:decimal(x.rate),status:''};
+   if(/^(diverg[eê]ncia|divergence|pending|pendente|error|erro|inv[aá]lido|invalid)(?:$|:)/i.test(sourceStatus))issues.push('Status da origem: '+sourceStatus);
+   return {id:text(x.id)||'linha-'+i,worker:text(x.worker)||'Não informado',workerKey:text(x.workerId)||(linked?.size===1?[...linked][0]:text(x.worker)),duplicate:duplicates.has(i),conflict:conflicts.has(text(x.id)),date,rawDate:text(x.date),projectId:text(x.projectId)||'__unknown',project:text(p?.name)||text(x.projectId)||'Sem projeto',client:text(x.client)||text(p?.client),entry:text(x.entry),exit:text(x.exit),exitDate:endDate,minutes,start,end,basis,issues,correction,notes:text(x.notes),sourceStatus,rate:decimal(x.rate),status:''};
   });
   // Check the full source BEFORE filtering, so a project filter cannot hide double booking.
-  rows.forEach((a,i)=>rows.slice(i+1).forEach(b=>{
-   if(a.workerKey&&a.workerKey===b.workerKey&&a.start!==null&&b.start!==null&&a.end>a.start&&b.end>b.start&&Math.max(a.start,b.start)<Math.min(a.end,b.end)){
-    for(const row of [a,b]){row.minutes=null;if(!row.issues.includes('Sobreposição de segmentos; excluído dos totais'))row.issues.push('Sobreposição de segmentos; excluído dos totais')}
+  const byWorker=new Map();
+  rows.forEach(r=>{if(!r.workerKey||r.minutes===null||r.duplicate||r.conflict||r.start===null||r.end<=r.start)return;if(!byWorker.has(r.workerKey))byWorker.set(r.workerKey,[]);byWorker.get(r.workerKey).push(r)});
+  for(const group of byWorker.values()){
+   group.sort((a,b)=>a.start-b.start);
+   for(let i=0;i<group.length;i++)for(let j=i+1;j<group.length&&group[j].start<group[i].end;j++){
+    for(const row of [group[i],group[j]]){row.minutes=null;if(!row.issues.includes('Sobreposição de segmentos; excluído dos totais'))row.issues.push('Sobreposição de segmentos; excluído dos totais')}
    }
-  }));
+  }
   rows.forEach(r=>{r.status=r.issues.length?'Divergência':r.correction?'Corrigido':r.basis.startsWith('Horas lançadas')?'Horas lançadas':'Concluído';if(r.issues.length===1&&r.issues[0]==='Saída pendente')r.status='Em aberto'});
   return rows;
  }
  function summarize(rows,filters={}){
-  const invalidPeriod=!!(filters.from&&filters.to&&filters.from>filters.to);
+  const invalidPeriod=!!((Object.hasOwn(filters,'from')&&!dateKey(filters.from))||(Object.hasOwn(filters,'to')&&!dateKey(filters.to))||(filters.from&&filters.to&&filters.from>filters.to));
   const selected=invalidPeriod?[]:rows.filter(r=>(!filters.from||r.date&&r.date>=filters.from)&&(!filters.to||r.date&&r.date<=filters.to)&&(!filters.worker||r.workerKey===filters.worker)&&(!filters.project||r.projectId===filters.project)&&(!filters.client||r.client===filters.client)&&(!filters.status||r.status===filters.status));
   const total=selected.reduce((sum,r)=>sum+(r.minutes??0),0),workers=new Map(),projects=new Map(),daily=new Map();
   function add(map,key,label,r){if(!map.has(key))map.set(key,{key,label,minutes:0,segments:[],cost:0,unknownCost:false});const g=map.get(key);g.minutes+=r.minutes??0;g.segments.push(r);if(r.minutes===null||!r.rate)g.unknownCost=true;else g.cost+=r.minutes/60*r.rate;}
-  selected.forEach(r=>{add(workers,r.workerKey,r.worker,r);add(projects,r.projectId,r.project,r);add(daily,`${r.date}|${r.workerKey}`,r.worker,r)});
+  selected.forEach(r=>{if(r.workerKey)add(workers,r.workerKey,r.worker,r);add(projects,r.projectId,r.project,r);add(daily,`${r.date}|${r.workerKey}`,r.worker,r)});
   const direction=filters.sort==='asc'?1:-1,sort=(a,b)=>direction*(a.minutes-b.minutes)||a.label.localeCompare(b.label,'pt-BR');
   return {invalidPeriod,selected,total,count:workers.size,average:workers.size?total/workers.size:0,excluded:selected.filter(r=>r.minutes===null).length,workers:[...workers.values()].sort(sort),daily:[...daily.values()].sort(sort),projects:[...projects.values()].map(g=>({...g,percent:total?g.minutes/total*100:null})).sort(sort)};
  }
